@@ -15,3 +15,6 @@ HLE_FORCE("_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_
           void, h_nv_SetDevAlloc, nv_alloc_fn a, nv_free_fn f, nv_realloc_fn r, void *u) { g_nv_devtools_alloc = (struct nv_allocator){a, f, r, u}; }
 HLE_FORCE("_ZN2nv18InitializeGraphicsEPvm", WHY, void, h_nv_Init, void *mem, unsigned long size) { (void)mem; (void)size; }
 HLE_FORCE("_ZN2nv16FinalizeGraphicsEv", WHY, void, h_nv_Fin, void) {}
+// unofficial patch (Keep Driving, GameMaker): the memory report asks the driver, which the host does not have
+HLE_FORCE("_ZN2nv22DumpGraphicsMemoryInfoEv", WHY "; nothing to report", void, h_nv_DumpMem, void) {}
+HLE_FORCE("_ZN2nv21GetGraphicsMemoryInfoEPNS_10MemoryInfoE", WHY "; the info is left as the game set it", void, h_nv_GetMem, void *info) { (void)info; }

@@ -103,10 +103,40 @@ def fixups(t):
 def glsl_type(t, refl):
     return refl['types'][t]['name'] if t in refl.get('types', {}) else t
 
+GLSL_TYPES = VEC_TYPES | {'mat2x2', 'mat3x3', 'mat4x4', 'sampler2D', 'samplerCube', 'sampler3D', 'sampler2DShadow'}
+
+ES3_RESERVED = ('sample', 'smooth', 'flat', 'centroid', 'patch', 'buffer', 'shared', 'coherent', 'volatile', 'restrict', 'readonly', 'writeonly', 'input', 'output', 'filter', 'active', 'resource', 'precise', 'subroutine', 'noperspective', 'common', 'partition')
+
+def es100_to_310(src, stage):
+    """unofficial patch: a shader with no #version line is GLSL ES 1.00 (GameMaker's); glslang's SPIR-V path needs ES 3.10, so upgrade the 1.00 syntax.
+    The source key is still the hash of the original text, so the host finds it as before"""
+    if b'#version' in src: return src
+    t = src.decode('latin-1')
+    t = t.replace('\r\n', '\n')
+    # words that became reserved in GLSL ES 3.x but are plain names in 1.00 (a variable named sample)
+    for w in ES3_RESERVED: t = re.sub(r'\b%s\b' % w, 'dm_' + w, t)
+    # swizzle == number (NVIDIA's compiler takes a vector compared with a scalar): compare with a vector of that number
+    t = re.sub(r'(\.([xyzwrgba]{2,4}))\s*(==|!=)\s*([0-9]*\.?[0-9]+)\b', lambda m: '%s %s vec%d(%s)' % (m.group(1), m.group(3), len(m.group(2)), m.group(4)), t)
+    if stage == 'vert':
+        t = re.sub(r'\battribute\b', 'in', t)
+        t = re.sub(r'\bvarying\b', 'out', t)
+        head = '#version 310 es\nprecision highp float;\nprecision highp int;\n'
+    else:
+        t = re.sub(r'\bvarying\b', 'in', t)
+        head = '#version 310 es\nprecision mediump float;\nprecision mediump int;\n'
+        if re.search(r'\bgl_FragData\s*\[\s*0\s*\]', t) or re.search(r'\bgl_FragColor\b', t):
+            t = re.sub(r'\bgl_FragData\s*\[\s*0\s*\]', 'dm_FragColor', t)
+            t = re.sub(r'\bgl_FragColor\b', 'dm_FragColor', t)
+            head += 'layout(location = 0) out vec4 dm_FragColor;\n'
+    # a uniform of a struct type (GameMaker's u_LightEnv) is not supported by the layer's uniform table: make it a plain global (zero), which turns that lighting off
+    t = re.sub(r'\buniform\s+(\w+)\s+(\w+)\s*;', lambda m: m.group(0) if m.group(1) in GLSL_TYPES or m.group(1) in ('lowp', 'mediump', 'highp') else f'{m.group(1)} {m.group(2)};', t)
+    return (head + t).encode('latin-1')
+
+
 def translate(src, stage, key, tmp):
     """GLSL → MSL; returns (msl path, table fields) or an error string"""
     g = os.path.join(tmp, f'{key}.{stage}'); spv = g + '.spv'; msl = os.path.join(tmp, f'{key}_{stage[0]}.metal')
-    open(g + '.in', 'wb').write(src)
+    open(g + '.in', 'wb').write(es100_to_310(src, stage))   # unofficial patch: GLSL ES 1.00
     r = subprocess.run(['glslangValidator', '-E', '-S', stage, g + '.in'], capture_output=True, text=True)
     if r.returncode: return 'glslang -E: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
     pre = r.stdout[r.stdout.find('#version'):]   # warnings come first

@@ -10728,8 +10728,68 @@ static uint64_t snap_take(const tex_t *t) {
     g_snap[k].ev = v;
     return g_snap[k].serial;
 }
+// Unofficial patch: a classic-queue present for devices without Metal 4 (macOS 15), used by the GL and Vulkan layers
+static id<MTLRenderPipelineState> g_cls_pso; static MTLPixelFormat g_cls_pf; static id<MTLSamplerState> g_cls_smp;
+static uint64_t present_classic(const tex_t *t, uint64_t ev_val) {
+    @autoreleasepool {
+        CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
+        if (!layer) return 0;
+        if (layer.device != g_dev) layer.device = g_dev;
+        id<MTLTexture> src = (id<MTLTexture>)serial_get(t->serial);
+        if (!src) return 0;
+        if (!g_cls_pso || g_cls_pf != layer.pixelFormat) {
+            static const char *msl =
+                "#include <metal_stdlib>\n"
+                "using namespace metal;\n"
+                "struct V { float4 p [[position]]; float2 uv; };\n"
+                "vertex V cls_v(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V o; o.p = float4(q * 2.0 - 1.0, 0.0, 1.0); o.uv = float2(q.x, 1.0 - q.y); return o; }\n"
+                "fragment float4 cls_f(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant int &flip [[buffer(0)]]) { float2 uv = v.uv; if (flip) uv.y = 1.0 - uv.y; return t.sample(s, uv); }\n";
+            NSError *e = nil;
+            id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:msl] options:nil error:&e];
+            if (!lib) { MLOG("[RED] classic present: shader: %s", e.description.UTF8String); return 0; }
+            MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+            d.vertexFunction = [lib newFunctionWithName:@"cls_v"];
+            d.fragmentFunction = [lib newFunctionWithName:@"cls_f"];
+            d.colorAttachments[0].pixelFormat = layer.pixelFormat;
+            g_cls_pso = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+            if (!g_cls_pso) { MLOG("[RED] classic present: pipeline: %s", e.description.UTF8String); return 0; }
+            g_cls_pf = layer.pixelFormat;
+            MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+            sd.minFilter = MTLSamplerMinMagFilterLinear; sd.magFilter = MTLSamplerMinMagFilterLinear;
+            g_cls_smp = [g_dev newSamplerStateWithDescriptor:sd];
+            MLOG("classic present: no Metal 4, presenting through a classic queue (layer pixel format %lu)", (unsigned long)g_cls_pf);
+        }
+        id<CAMetalDrawable> dr = [layer nextDrawable];
+        if (!dr) return 0;
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        if (ev_val && g_ext_ev) [cb encodeWaitForEvent:g_ext_ev value:ev_val];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dr.texture;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+        [en setRenderPipelineState:g_cls_pso];
+        {   // letterbox to the centered 16:9 picture, the same rectangle the Mac front end maps mouse clicks to (front_mac.m)
+            double W = dr.texture.width, H = dr.texture.height, w = W, h = H;
+            if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
+            [en setViewport:(MTLViewport){(W - w) / 2, (H - h) / 2, w, h, 0.0, 1.0}];
+        }
+        [en setFragmentTexture:src atIndex:0];
+        [en setFragmentSamplerState:g_cls_smp atIndex:0];
+        int flip = getenv("DM_CLASSIC_NOFLIP") ? 0 : 1;
+        [en setFragmentBytes:&flip length:sizeof flip atIndex:0];
+        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [en endEncoding];
+        [cb presentDrawable:dr];
+        [cb commit];
+        [cb waitUntilCompleted];   // the game reuses its window image right after; keep it simple and safe
+    }
+    return 0;
+}
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val) {
     atomic_store(&dm_present_ns, now_ns());
+    if (g_classic && t && !atomic_load(&g_present_discard)) return present_classic(t, ev_val);   // unofficial patch
     if (g_classic || atomic_load(&g_present_discard)) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait (g_classic: no Metal 4 queue to present on)
     if (t) { xv_check(t->serial, 0, 0, "present"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);

@@ -595,6 +595,18 @@ static int tex_make(tex_t *t, int rt) {
         if (swz && rt) RED1("texture %ux%u %s with a swizzle is a framebuffer attachment (Metal renders into no swizzled texture)", t->w, t->h, m->name);
         t->tex = [g_dev newTextureWithDescriptor:td];
         if (!t->tex) { GLOG("[RED] texture %ux%u %s (%d levels) could not be made", t->w, t->h, m->name, lv); t->made = 1; return 0; }
+        if (td.storageMode == MTLStorageModePrivate && (td.usage & MTLTextureUsageRenderTarget) && m->kind == K_COL && !vol) {   // unofficial patch: zeroed, as on the Switch
+            id<MTLCommandBuffer> zb = [g_q commandBuffer]; zb.label = @"gl zero rt";
+            int nsl = faces == 6 ? 6 : arr ? (int)umax(1, t->d) : 1;
+            for (int l = 0; l < lv; l++) for (int f = 0; f < nsl; f++) {
+                MTLRenderPassDescriptor *zp = [MTLRenderPassDescriptor renderPassDescriptor];
+                zp.colorAttachments[0].texture = t->tex; zp.colorAttachments[0].level = l; zp.colorAttachments[0].slice = f;
+                zp.colorAttachments[0].loadAction = MTLLoadActionClear; zp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                zp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                [[zb renderCommandEncoderWithDescriptor:zp] endEncoding];
+            }
+            [zb commit];
+        }
         for (int f = 0; f < faces; f++) for (int l = 0; l < lv; l++) {
             level_t *p = &t->pend[f][l];
             if (p->data && td.storageMode == MTLStorageModeShared)
@@ -903,6 +915,7 @@ static void bind_uniforms_textures(prog_t *p) {
     }
     E.prog = p->serial;
 }
+static uint32_t g_cl_hi;   // unofficial patch: vertices (or instances) the current draw reads, for client-memory arrays
 // Everything a draw needs; 0 = skip it
 static int draw_setup(void) {
     prog_t *p = prog_of(S.prog);
@@ -914,7 +927,8 @@ static int draw_setup(void) {
         int s = vs->a[i].slot; vattr_t *a = &v->a[p->amap[s]];
         if (!a->on) continue;
         buf_t *b = buf_of(a->buf);
-        if (!b || !b->mb) { RED1("vertex attribute %d reads client memory or a buffer with no data (not implemented)", p->amap[s]); return 0; }
+        if (!a->buf && a->off && g_cl_hi) { }   // unofficial patch: client memory, copied when it is bound below
+        else if (!b || !b->mb) { RED1("vertex attribute %d reads client memory or a buffer with no data (not implemented)", p->amap[s]); return 0; }
         k.vf[s] = (uint32_t)vfmt_of(a);
         k.stride[s] = a->stride ? a->stride : a->size * vtype_bytes(a->type); k.div[s] = a->div;
         if (!k.vf[s] || (k.stride[s] & 3)) { RED1("vertex attribute %d: type %#x size %d stride %d not mapped", p->amap[s], a->type, a->size, a->stride); return 0; }
@@ -928,7 +942,13 @@ static int draw_setup(void) {
     enc_state();
     for (int i = 0; i < vs->na; i++) {
         int s = vs->a[i].slot, gi = p->amap[s]; vattr_t *a = &v->a[gi];
-        if (a->on) { buf_t *b = buf_of(a->buf); b->use = g_serial; [e setVertexBuffer:b->mb offset:a->off atIndex:30 - s]; }
+        if (a->on && !a->buf && a->off && g_cl_hi) {   // unofficial patch: a client-memory vertex array, copied into transient memory for this draw
+            size_t el = (size_t)a->size * vtype_bytes(a->type), st = a->stride ? (size_t)a->stride : el, n = (size_t)(g_cl_hi - 1) * st + el, o;
+            id<MTLBuffer> cb = arena_alloc(n + 16, &o);
+            memcpy((uint8_t *)cb.contents + o, (const void *)(uintptr_t)a->off, n);
+            [e setVertexBuffer:cb offset:o atIndex:30 - s];
+        }
+        else if (a->on) { buf_t *b = buf_of(a->buf); b->use = g_serial; [e setVertexBuffer:b->mb offset:a->off atIndex:30 - s]; }
         else [e setVertexBytes:S.va[gi] length:16 atIndex:30 - s];
     }
     bind_uniforms_textures(p);
@@ -960,6 +980,7 @@ static void draw_arrays(GLenum mode, GLint first, GLsizei count, GLsizei inst) {
     if (count <= 0 || inst <= 0) return;
     @autoreleasepool {
         int conv; MTLPrimitiveType pt = prim_of(mode, &conv);
+        g_cl_hi = (uint32_t)(first + count) > (uint32_t)inst ? (uint32_t)(first + count) : (uint32_t)inst;   // unofficial patch
         if (conv < 0 || !draw_setup()) return;
         if (!conv) { [g_enc drawPrimitives:pt vertexStart:first vertexCount:count instanceCount:inst]; return; }
         size_t off; id<MTLBuffer> b = arena_alloc((size_t)count * 6 * 4 + 16, &off);
@@ -977,6 +998,11 @@ static void draw_elements(GLenum mode, GLsizei count, GLenum type, const void *i
         uintptr_t io = (uintptr_t)indices; int isz = type == GL_UNSIGNED_INT ? 4 : type == GL_UNSIGNED_SHORT ? 2 : 1;
         const uint8_t *src = eb ? (eb->mb ? (const uint8_t *)eb->mb.contents + io : NULL) : (const uint8_t *)indices;
         if (!src || (eb && io + (size_t)count * isz > eb->size)) { RED1("glDrawElements: indices outside their buffer"); return; }
+        {   // unofficial patch: the highest vertex the indices reach, for client-memory arrays
+            uint32_t mx = 0;
+            for (GLsizei i = 0; i < count; i++) { uint32_t x = isz == 4 ? ((const uint32_t *)src)[i] : isz == 2 ? ((const uint16_t *)src)[i] : src[i]; if (x > mx) mx = x; }
+            g_cl_hi = mx + 1 + (base > 0 ? (uint32_t)base : 0); if ((uint32_t)inst > g_cl_hi) g_cl_hi = (uint32_t)inst;
+        }
         if (!draw_setup()) return;
         if (!conv && isz > 1 && eb && io % 4 == 0) {   // the game's own index buffer
             eb->use = g_serial;
