@@ -10,6 +10,7 @@
 // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
 #include "../../host/hle.h"
 #include "nvn_protos.h"
+#include <math.h>
 #include "nvn_count.h"
 #include "nvn_tex.h"
 #include "../tex/nvn_deswizzle.h"
@@ -2568,6 +2569,41 @@ static void fstep_tick(const win_t *o, int c) {
         t0 = t; v0 = vs; memset(held, 0, sizeof held); drain_n = drain_cut = 0;
     }
 }
+// DM_RENDER_SCALE_AUTO=<min>[-<max>] (a build with a render-scale stub, which reads state +0x10 every frame: Tears of the Kingdom, Breath of the Wild): the host sets the scale
+// itself, between min (0.5 or more) and max (default DM_RENDER_SCALE, else 1.0; at exactly 1.0 the game's own dynamic resolution runs), to hold the GPU time of a frame under
+// DM_RENDER_SCALE_GPU_MS (13 ms by default: 60 fps leaves room for the present and its upscaling). Every 15 presents it averages the GPU times (taken 8 frames late) and scales the
+// pixel count by budget / GPU time: down at once, by at most 0.1 a step; up by at most 0.05, only when the GPU is under 85% of the budget. Steps of 0.025 keep the views from
+// changing size every few frames. The log names each change (the first 60) and a summary every 1800 presents
+static void rs_auto_tick(void) {
+    static int on = -1; static float lo = 0.5f, hi = 1.0f, cur; static double budget = 13.0, sum; static int n, nlog; static uint64_t ups, downs, last_f, sum_f; static double scale_sum;
+    if (on < 0) {
+        const char *e = getenv("DM_RENDER_SCALE_AUTO"); on = 0;
+        if (!e || !*e || !strcmp(e, "0")) return;
+        if (!dm_fps_state || !dm_render_scale_stub) { LOG("[RED] DM_RENDER_SCALE_AUTO=%s: this build has no render-scale stub; ignored", e); return; }
+        char *end; lo = strtof(e, &end); if (*end == '-') hi = strtof(end + 1, &end); else { const char *m = getenv("DM_RENDER_SCALE"); hi = m ? strtof(m, NULL) : 1.0f; }
+        if (*end || !(lo >= 0.5f && lo <= 1.0f) || !(hi >= lo && hi <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE_AUTO=%s: must be min[-max] within 0.5 to 1.0; ignored", e); return; }
+        const char *b = getenv("DM_RENDER_SCALE_GPU_MS"); if (b) { double v = atof(b); if (v >= 4 && v <= 30) budget = v; }
+        cur = hi; on = 1;
+        __atomic_store_n((uint32_t *)(dm_fps_state + 0x10), *(uint32_t *)&cur, __ATOMIC_RELAXED);
+        LOG("[nvn] render scale: automatic, %.3f to %.3f, GPU budget %.1f ms a frame (DM_RENDER_SCALE_AUTO)", lo, hi, budget);
+    }
+    if (!on || g_frame < 8 || g_frame - 8 == last_f) return;
+    last_f = g_frame - 8; double g = mtl_gpu_ms(last_f); if (g < 0) return;
+    sum += g; n++; scale_sum += cur; sum_f++;
+    if (n < 15) return;
+    double avg = sum / n; sum = 0; n = 0;
+    float nx = cur * (float)sqrt(budget / avg);   // the GPU time follows the pixel count, the square of the scale
+    if (nx < cur) { if (nx < cur - 0.1f) nx = cur - 0.1f; }
+    else if (avg < 0.85 * budget) { if (nx > cur + 0.05f) nx = cur + 0.05f; }
+    else nx = cur;
+    nx = roundf(nx * 40.f) / 40.f; if (nx < lo) nx = lo; if (nx > hi) nx = hi;
+    if (nx != cur) {
+        if (nx > cur) ups++; else downs++;
+        if (nlog < 60) { nlog++; LOG("[nvn] render scale %.3f → %.3f (GPU %.1f ms a frame over the last 15, budget %.1f)%s", cur, nx, avg, budget, nlog == 60 ? "; further changes only counted" : ""); }
+        cur = nx; __atomic_store_n((uint32_t *)(dm_fps_state + 0x10), *(uint32_t *)&cur, __ATOMIC_RELAXED);
+    }
+    if (sum_f >= 1800) { LOG("[nvn] render scale: mean %.3f over %llu frames, %llu up / %llu down, now %.3f", scale_sum / sum_f, (unsigned long long)sum_f, (unsigned long long)ups, (unsigned long long)downs, cur); sum_f = 0; scale_sum = 0; ups = downs = 0; }
+}
 // The crop a present shows: the window's own (nvnWindowSetCrop), else the vi layer's (vi::SetLayerCrop, hle_vi.c); on the Switch both become the crop of the buffer queued to the layer.
 // Link's Awakening crops only its layer: in handheld mode it draws 1280x720 into its 1920x1080 window textures and crops the layer to that. A layer crop that does not fit the
 // texture is reported once and the whole texture shown, as before the layer crop was read here. lc receives the layer crop
@@ -2590,6 +2626,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     int c = fps_step_cap();
     if (dm_fps_state) { static int was; if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? (dm_movie_playing() ? " (movie playing)" : thermal_capped() ? " (thermal state serious)" : "") : ""); was = c; } }
     if (c) fstep_tick(o, c);
+    rs_auto_tick();
     dm_fps_lock_tick();   // after the frame step: at 120 fps the target follows the hold just decided
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     present_cfg(o);

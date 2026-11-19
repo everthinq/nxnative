@@ -483,6 +483,11 @@ static void res_check(id r, const char *what, int reg) {
     if (is_tex) { id<MTLTexture> t = (id<MTLTexture>)a; while (t.parentTexture) { t = t.parentTexture; hops++; } a = t.buffer ? (id<MTLResource>)t.buffer : (id<MTLResource>)t; }
     if (a != r) { pthread_mutex_lock(&g_res_mu); res_use_note(a, what); pthread_mutex_unlock(&g_res_mu); }
     pthread_mutex_lock(&g_res_mu); int ok = [g_res_objects containsObject:a.heap ? (id)a.heap : a]; pthread_mutex_unlock(&g_res_mu);
+#if DM_METAL3
+    // The Metal 3 queue's residency set is built from nx3_resources (nx3_rs_sync), not from g_res_objects: check that too
+    { static int nbad3; [nx3_registry_lock lock]; int ok3 = [nx3_resources containsObject:a]; [nx3_registry_lock unlock];
+      if (!ok3 && nbad3 < 40) { nbad3++; MLOG("[RED] metal3 missing residency #%d: %s slot %d %s %p (heap %p, in g_res_objects %d) allocated %lu B", nbad3, what, reg, is_tex ? "texture" : "buffer", (__bridge void *)a, (__bridge void *)a.heap, ok, (unsigned long)a.allocatedSize); } }
+#endif
     if (!ok) { nbad++; id<MTLTexture> t = is_tex ? (id<MTLTexture>)r : nil;
         MLOG("[RED] missing residency #%d: %s slot %d %s %p (parent chain %d deep) allocated %lu B storage mode %lu%s", nbad, what, reg, is_tex ? "texture" : "buffer", (__bridge void *)a, hops, (unsigned long)a.allocatedSize, (unsigned long)a.storageMode,
              t ? [NSString stringWithFormat:@" format %lu %lux%lu type %lu usage %#lx", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.textureType, (unsigned long)t.usage].UTF8String : ""); }
