@@ -73,6 +73,11 @@ Game-specific findings. The general host changes they led to are listed under [F
 - Shaders: `Shader/*.bfsha.zs` (BNSH; `material.bfsha` holds most) and the layout shaders in `Shader/ApplicationPackage.Nin_NX_NVN.release.sarc.zs`.
 - **Resolved in the host: duplicate pipeline keys from unused colour state.** MacNativeGames commit `f3e2f66`, reported in [PR #196](https://github.com/seedds/nxnative/pull/196), found 8,479 of 24,146 recorded render pipelines (35%) differed only in unused state. The general normalization and prewarm deduplication are ported; this is the source project's measurement, with no new gameplay or prewarm-count measurement on this game here.
 
+## macOS 15 (Metal 3 backend, branch `metal3-mac`)
+
+- **Current (2026-11-19): plays on an M1 MacBook Air (8 GB, macOS 15.8) with flickering.** Built with `DM_METAL3=1 --gpu none --no-prebake`. The first run held 5 fps (GPU p50 90–190 ms); `DM_OPMODE=0 DM_RENDER_SCALE=0.5` only took 16% off. The Metal 3 adapter declared all ~2,150 allocations read+write on nearly every encoder; with one residency set on the queue (`DM_M3_DECLARE=set`, [macOS 15](../../../docs/macos15.md)) the intro holds 60 fps (GPU about 10 ms) and the opening cave in handheld mode 30–60 fps (GPU 13–22 ms), no `[RED]` lines, footprint 2.5–2.8 GB. The image flickers in play (reported by the user, not yet looked at; suspect: pointee write hazards no longer declared).
+- Headless runs: `DM_FOCUS_KEEP=1 DM_WINDOW_TOP=1`, or the game pauses as soon as another window is in front (focus state 2, audio silent, black frames).
+
 ## Mac routes
 
 - **Layered-clear review, 2026-11-01 (#808): incomplete runtime validation.** All 28,669 shaders built without failures. The baseline cave route completed at 59.8 fps with no red diagnostics. The candidate stopped at frame 1,500 immediately after focus changed to 2 and notification 15 was consumed: its main thread waited in `h_oe_PopMsg`, with GPU fences submitted/completed both 1,502 and the present queue drained. This was a focus pause, not an outstanding GPU wait. The foreground-controlled repeat was stopped at the maintainer's request during pipeline preparation, so this game is not recorded as validated for the change.

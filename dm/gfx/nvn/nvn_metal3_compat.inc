@@ -111,6 +111,61 @@ static void nx3_stats_line(char *out, size_t size) {
         (unsigned long long)atomic_exchange(&nx3_binding_skips, 0), (unsigned long long)atomic_exchange(&nx3_declarations, 0));
 }
 
+// Blanket declarations: how often an encoder re-declares the whole registry, and how big it is.
+static int nx3_declare_mode(void) {
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("DM_M3_DECLARE"); mode = !e || !*e || !strcmp(e, "set") ? 3 : !strcmp(e, "rw") ? 2 : !strcmp(e, "r") ? 1 : !strcmp(e, "off") ? 0 : 3;
+        fprintf(stderr, "[dm] [metal3] resource declaration mode %s (DM_M3_DECLARE)\n", mode == 3 ? "set (one residency set on the queue)" : mode == 2 ? "rw" : mode == 1 ? "r" : "off"); }
+    return mode;
+}
+static _Atomic uint64_t nx3_decl_n, nx3_decl_objects, nx3_decl_max;
+static _Atomic double nx3_decl_last;
+static void nx3_declare_note(NSUInteger count, int mode) {
+    uint64_t n = atomic_fetch_add_explicit(&nx3_decl_n, 1, memory_order_relaxed) + 1;
+    atomic_fetch_add_explicit(&nx3_decl_objects, count, memory_order_relaxed);
+    uint64_t mx = atomic_load_explicit(&nx3_decl_max, memory_order_relaxed); if (count > mx) atomic_store_explicit(&nx3_decl_max, count, memory_order_relaxed);
+    double now = CACurrentMediaTime(), last = atomic_load_explicit(&nx3_decl_last, memory_order_relaxed);
+    if (last == 0) { atomic_store_explicit(&nx3_decl_last, now, memory_order_relaxed); return; }
+    if (now - last < 10.0) return;
+    atomic_store_explicit(&nx3_decl_last, now, memory_order_relaxed);
+    uint64_t objs = atomic_exchange(&nx3_decl_objects, 0); atomic_store(&nx3_decl_n, 0); atomic_store(&nx3_decl_max, 0);
+    fprintf(stderr, "[dm] [metal3] blanket resource declarations (%s) in %.1f s: %llu, %.0f objects each on average, %llu at most\n",
+        mode == 2 ? "rw" : mode == 1 ? "r" : "off", now - last, (unsigned long long)n, n ? (double)objs / n : 0.0, (unsigned long long)mx);
+}
+
+// DM_M3_DECLARE=set: one residency set with every registered allocation, attached to the replay
+// queue and rebuilt at a commit only when the registry changed since the last rebuild.
+static id<MTLResidencySet> nx3_rs;
+static uint64_t nx3_rs_gen, nx3_rs_rebuilds;
+static double nx3_rs_last_log;
+static void nx3_rs_sync(id<MTLCommandQueue> q) {
+    if (nx3_declare_mode() != 3) return;
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&m);
+    do {
+        if (!nx3_rs) {
+            MTLResidencySetDescriptor *d = [MTLResidencySetDescriptor new]; d.initialCapacity = 4096; d.label = @"nx3 registry";
+            NSError *e = nil; nx3_rs = [q.device newResidencySetWithDescriptor:d error:&e];
+            if (!nx3_rs) { fprintf(stderr, "[RED] Metal3 residency set: %s\n", e.localizedDescription.UTF8String); abort(); }
+            [q addResidencySet:nx3_rs];
+        }
+        uint64_t g = atomic_load_explicit(&nx3_resource_generation, memory_order_acquire);
+        if (g == nx3_rs_gen) break;
+        @autoreleasepool {
+            [nx3_registry_lock lock]; NSArray *all = nx3_resources.allObjects; g = atomic_load_explicit(&nx3_resource_generation, memory_order_relaxed); [nx3_registry_lock unlock];
+            [nx3_rs removeAllAllocations];
+            for (id o in all) [nx3_rs addAllocation:o];
+            [nx3_rs commit];
+            nx3_rs_gen = g; nx3_rs_rebuilds++;
+            double now = CACurrentMediaTime();
+            if (now - nx3_rs_last_log >= 10.0) {
+                fprintf(stderr, "[dm] [metal3] residency set: %llu rebuilds so far, %lu allocations, %.0f MB\n", (unsigned long long)nx3_rs_rebuilds, (unsigned long)all.count, nx3_rs.allocatedSize / 1048576.0);
+                nx3_rs_last_log = now;
+            }
+        }
+    } while (0);
+    pthread_mutex_unlock(&m);
+}
+
 @interface NX3AllocatorDescriptor : NSObject
 @property(copy) NSString *label;
 @end
@@ -250,17 +305,22 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
     if (reflectedResources) return; // encode_args declared the actual pointees with their read/write usage.
     // useResources is an encoder declaration, not a per-draw operation. Repeat
     // only when an allocation/view adds a possible argument-buffer pointee.
+    if (nx3_declare_mode() == 3) return; // the queue's residency set (nx3_rs_sync) keeps every allocation resident
     uint64_t generation = atomic_load_explicit(&nx3_resource_generation, memory_order_acquire);
     if (declaredGeneration == generation) return;
     @autoreleasepool {
         if (!resourceSnapshot) resourceSnapshot = [NX3ResourceSnapshot new];
         NSArray *resources = nx3_snapshot(resourceSnapshot); generation = resourceSnapshot.generation;
         NSUInteger count = resources.count;
-        if (count) {
+        // DM_M3_DECLARE: set (default: nx3_rs_sync, no per-encoder declaration), rw (the old blanket read+write declaration), r, off; see nx3_declare_mode.
+        int mode = nx3_declare_mode();
+        MTLResourceUsage usage = mode == 1 ? MTLResourceUsageRead : MTLResourceUsageRead | MTLResourceUsageWrite;
+        if (count && mode) {
             __unsafe_unretained id<MTLResource> objects[count]; [resources getObjects:objects range:NSMakeRange(0, count)];
-            if (kind == 1) [(id<MTLRenderCommandEncoder>)native useResources:objects count:count usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment | (ot ? MTLRenderStageObject : 0) | (mt ? MTLRenderStageMesh : 0)];
-            else [(id<MTLComputeCommandEncoder>)[self compute] useResources:objects count:count usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            if (kind == 1) [(id<MTLRenderCommandEncoder>)native useResources:objects count:count usage:usage stages:MTLRenderStageVertex | MTLRenderStageFragment | (ot ? MTLRenderStageObject : 0) | (mt ? MTLRenderStageMesh : 0)];
+            else [(id<MTLComputeCommandEncoder>)[self compute] useResources:objects count:count usage:usage];
         }
+        nx3_declare_note(count, mode);
         declaredGeneration = generation; atomic_fetch_add_explicit(&nx3_declarations, 1, memory_order_relaxed);
     }
 }
@@ -415,6 +475,7 @@ static void nx3_present_read_resources(NX3Encoder *encoder, id<MTLTexture> sourc
 - (void)commit:(id<NX3CommandBuffer> const *)buffers count:(NSUInteger)n options:(NX3CommitOptions *)o {
     for (NSUInteger i = 0; i < n; i++) { NX3CommandBuffer *b = (NX3CommandBuffer *)buffers[i]; id<MTLCommandBuffer> cb = b.native; NSArray *handlers = [o.handlers copy]; dispatch_queue_t q = self.feedbackQueue;
         if (handlers.count) [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { NX3Feedback *f = [NX3Feedback new]; f.buffer = done; dispatch_block_t invoke = ^{ for (void (^block)(id<NX3Feedback>) in handlers) block(f); }; if (q) dispatch_async(q, invoke); else invoke(); }];
+        nx3_rs_sync(self.native);
         [cb commit]; self.last = cb;
     }
 }
