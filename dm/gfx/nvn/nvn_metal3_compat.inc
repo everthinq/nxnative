@@ -240,6 +240,32 @@ static void nx3_pipeline_stage(NX3PipelineBindings *mask, NSArray<id<MTLBinding>
         } else if (b.type == MTLBindingTypeSampler && i < 128) mask->samplers[stage][i / 64] |= 1ull << (i % 64);
     }
 }
+// DM_M3_DECLARE=set keeps every allocation resident but declares no argument-buffer pointees, so Metal's
+// hazard tracking no longer orders an encoder that writes through a pointee before one that reads it.
+// The replay's MTL4 queue barriers say where that order is needed: each encoder waits (at its start) on
+// the fence the last encoder updated, before the stages the barriers name, and updates the other fence at
+// its end. Two fences so no encoder waits on the fence it updates. Encoding is on the replay thread.
+static id<MTLFence> nx3_fences[2];
+static int nx3_fence_last;           // the fence the last ended encoder updated
+static MTLStages nx3_fence_before;   // the later stages the last end barrier ordered (beforeQueueStages)
+static uint64_t nx3_fence_waits, nx3_fence_updates;
+static int nx3_fence_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_M3_FENCE"); on = nx3_declare_mode() == 3 && !(e && !strcmp(e, "0"));
+        fprintf(stderr, "[dm] [metal3] queue barriers as a fence chain: %s (DM_M3_FENCE)\n", on ? "on" : "off"); }
+    return on;
+}
+static id<MTLFence> nx3_fence(id<MTLDevice> d, int i) {
+    if (!nx3_fences[0]) { nx3_fences[0] = [d newFence]; nx3_fences[1] = [d newFence]; nx3_fences[0].label = @"nx3 queue barrier 0"; nx3_fences[1].label = @"nx3 queue barrier 1"; }
+    return nx3_fences[i];
+}
+static MTLRenderStages nx3_render_stages(MTLStages s) {
+    MTLRenderStages r = 0;
+    if (s & (MTLStageVertex | MTLStageObject | MTLStageMesh)) r |= MTLRenderStageVertex | MTLRenderStageObject | MTLRenderStageMesh;
+    if (s & MTLStageFragment) r |= MTLRenderStageFragment;
+    return r;
+}
+
 static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
     if (pipeline) objc_setAssociatedObject(pipeline, &nx3_pipeline_bindings_key, bindings, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -255,17 +281,43 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
     NX3ResourceSnapshot *resourceSnapshot;
     BOOL reflectedResources;
     __unsafe_unretained id reflectedObjects[256]; MTLResourceUsage reflectedUsage[256]; NSUInteger reflectedCount;
+    MTLStages fenceWait; BOOL fenceUpdated; // nx3_fence: stages a start barrier asked for before the native encoder existed; the native encoder updated the chain
 }
 - (id)compute;
+- (void)fenceBegin;
+- (void)fenceEnd:(MTLStages)after;
 - (id)blit;
 - (void)apply;
 @end
 @implementation NX3Encoder
 - (void)resetBindings { memset(validAddresses, 0, sizeof validAddresses); memset(validTextures, 0, sizeof validTextures); memset(validSamplers, 0, sizeof validSamplers); declaredGeneration = 0; reflectedResources = NO; reflectedCount = 0; }
-- (id)compute { if (kind == 3) { [native endEncoding]; native = nil; } if (!native) { native = [cb computeCommandEncoder]; [self resetBindings];
+- (id)compute { if (kind == 3) { [self fenceEnd:MTLStageAll]; [native endEncoding]; native = nil; } if (!native) { native = [cb computeCommandEncoder]; [self resetBindings]; kind = 2; [self fenceBegin];
         if (computePipeline) [native setComputePipelineState:computePipeline];
         for (NSUInteger i=0;i<32;i++) if (threadgroupMask & (1u<<i)) [native setThreadgroupMemoryLength:threadgroupLengths[i] atIndex:i]; } kind = 2; return native; }
-- (id)blit { if (kind == 2) { [native endEncoding]; native = nil; } if (!native) { native = [cb blitCommandEncoder]; [self resetBindings]; } kind = 3; return native; }
+- (id)blit { if (kind == 2 && native) { [self fenceEnd:MTLStageAll]; [native endEncoding]; native = nil; } if (!native) { native = [cb blitCommandEncoder]; [self resetBindings]; kind = 3; [self fenceBegin]; } kind = 3; return native; }
+// A new native encoder waits on the last update of the chain before the stages the last end barrier
+// ordered, plus any a start barrier asked for before it existed (lazy compute and blit encoders).
+- (void)fenceBegin {
+    fenceUpdated = NO;
+    if (!nx3_fence_on()) return;
+    MTLStages b = nx3_fence_before | fenceWait; fenceWait = 0;
+    if (!b || !nx3_fence_updates) return;
+    id<MTLFence> f = nx3_fence(cb.device, nx3_fence_last);
+    if (kind == 1) { MTLRenderStages r = nx3_render_stages(b); if (r) [(id<MTLRenderCommandEncoder>)native waitForFence:f beforeStages:r]; }
+    else if (kind == 2) [(id<MTLComputeCommandEncoder>)native waitForFence:f];
+    else [(id<MTLBlitCommandEncoder>)native waitForFence:f];
+    nx3_fence_waits++;
+}
+- (void)fenceEnd:(MTLStages)after {
+    if (!nx3_fence_on() || !native || fenceUpdated) return;
+    id<MTLFence> f = nx3_fence(cb.device, nx3_fence_last ^ 1);
+    if (kind == 1) { MTLRenderStages r = nx3_render_stages(after); [(id<MTLRenderCommandEncoder>)native updateFence:f afterStages:r ? r : MTLRenderStageVertex | MTLRenderStageFragment]; }
+    else if (kind == 2) [(id<MTLComputeCommandEncoder>)native updateFence:f];
+    else [(id<MTLBlitCommandEncoder>)native updateFence:f];
+    nx3_fence_last ^= 1; fenceUpdated = YES; nx3_fence_updates++;
+    static double last; double now = CACurrentMediaTime();
+    if (now - last >= 10.0) { if (last) fprintf(stderr, "[dm] [metal3] fence chain: %llu updates, %llu waits so far\n", (unsigned long long)nx3_fence_updates, (unsigned long long)nx3_fence_waits); last = now; }
+}
 - (BOOL)conformsToProtocol:(Protocol *)p { return p == @protocol(NX3Encoder) || p == @protocol(NX3RenderEncoder) || p == @protocol(NX3ComputeEncoder) || [super conformsToProtocol:p]; }
 - (void)applyTable:(NX3Table *)table stage:(int)stage {
     if (!table) return;
@@ -368,12 +420,27 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
     if (s & MTLRenderStageObject) ot=table; if (s & MTLRenderStageMesh) mt=table;
 }
 - (void)setArgumentTable:(NX3Table *)table { if (ct != table) [self resetBindings]; ct = table; }
-- (void)endEncoding { [native endEncoding]; native = nil; }
+- (void)endEncoding { if (native && !fenceUpdated && nx3_fence_on()) { [self fenceEnd:MTLStageAll]; nx3_fence_before = MTLStageAll; } [native endEncoding]; native = nil; }
 // Queue-boundary visibility is supplied by classic tracked resource hazards.
 // These calls occur at encoder boundaries; an intra-render memory barrier is
 // neither equivalent nor legal with an after-fragment stage on Apple GPUs.
-- (void)barrierAfterQueueStages:(MTLStages)a beforeStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
-- (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
+// With DM_M3_DECLARE=set they drive the fence chain (fenceBegin / fenceEnd).
+- (void)barrierAfterQueueStages:(MTLStages)a beforeStages:(MTLStages)b visibilityOptions:(NSUInteger)v {
+    (void)a; (void)v;
+    if (!nx3_fence_on() || !b) return;
+    if (!native) { fenceWait |= b; return; }
+    if (!nx3_fence_updates) return;
+    id<MTLFence> f = nx3_fence(cb.device, nx3_fence_last);
+    if (kind == 1) { MTLRenderStages r = nx3_render_stages(b); if (r) [(id<MTLRenderCommandEncoder>)native waitForFence:f beforeStages:r]; }
+    else if (kind == 2) [(id<MTLComputeCommandEncoder>)native waitForFence:f];
+    else [(id<MTLBlitCommandEncoder>)native waitForFence:f];
+    nx3_fence_waits++;
+}
+- (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(NSUInteger)v {
+    (void)v;
+    if (!nx3_fence_on() || !native) return;
+    [self fenceEnd:a]; nx3_fence_before = b;
+}
 - (void)barrierAfterEncoderStages:(MTLStages)a beforeEncoderStages:(MTLStages)b visibilityOptions:(NSUInteger)v {
     (void)v;
     if (kind == 1 && native) {
@@ -446,9 +513,9 @@ static void nx3_present_read_resources(NX3Encoder *encoder, id<MTLTexture> sourc
 @implementation NX3CommandBuffer
 - (void)beginCommandBufferWithAllocator:(id)a { (void)a; self.native = [self.queue commandBuffer]; self.resources = [NX3ResourceSnapshot new]; }
 - (void)endCommandBuffer {}
-- (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { NX3Encoder *e = [NX3Encoder new]; e->cb = self.native; e->resourceSnapshot = self.resources; e->native = [self.native renderCommandEncoderWithDescriptor:d]; e->kind = 1; return e; }
+- (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { NX3Encoder *e = [NX3Encoder new]; e->cb = self.native; e->resourceSnapshot = self.resources; e->native = [self.native renderCommandEncoderWithDescriptor:d]; e->kind = 1; [e fenceBegin]; return e; }
 - (id)computeCommandEncoder { NX3Encoder *e = [NX3Encoder new]; e->cb = self.native; e->resourceSnapshot = self.resources; e->kind = 2; return e; }
-- (id)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d { NX3Encoder *e = [NX3Encoder new]; e->cb = self.native; e->resourceSnapshot = self.resources; e->native = [self.native computeCommandEncoderWithDescriptor:d]; e->kind = 2; return e; }
+- (id)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d { NX3Encoder *e = [NX3Encoder new]; e->cb = self.native; e->resourceSnapshot = self.resources; e->native = [self.native computeCommandEncoderWithDescriptor:d]; e->kind = 2; [e fenceBegin]; return e; }
 - (NSString *)label { return self.native.label; }
 - (void)setLabel:(NSString *)s { self.native.label = s; }
 @end
