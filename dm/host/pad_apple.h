@@ -4,7 +4,11 @@
 // The Switch's layout is right A, bottom B, top X, left Y, so a Nintendo pad maps name for name and any other pad by position. Checked with a Pro Controller on the Mac
 // and on iOS (PR #650). Open: a single Joy-Con held sideways is matched too and has not been tried; if GameController keeps its labels there instead of turning them
 // with the controller, its face buttons come out a quarter turn off.
+// DM_PAD_FACE=label maps every pad by its printed labels instead (an Xbox pad's A, the bottom button, is the Switch's A, its B the Switch's B, and X and Y likewise): the
+// prompts a game shows then name the button with that letter on it, in the Xbox places (confirm at the bottom). Read once; unset or anything else: by position as above
 #pragma once
+#include <stdlib.h>
+#include <string.h>
 #import <GameController/GameController.h>
 #include <stdint.h>
 #include "dm_input.h"
@@ -16,6 +20,7 @@ static inline int dm_pad_labelled(GCController *c) {
 // DM_BTN_A / B / X / Y of the pad's pressed face buttons
 static inline uint64_t dm_pad_face(GCExtendedGamepad *g) {
     GCControllerButtonInput *a = g.buttonA, *b = g.buttonB, *x = g.buttonX, *y = g.buttonY;
-    if (!dm_pad_labelled(g.controller)) { GCControllerButtonInput *t = a; a = b; b = t; t = x; x = y; y = t; }   // by position: right A, bottom B, top X, left Y
+    static int by_label = -1; if (by_label < 0) { const char *e = getenv("DM_PAD_FACE"); by_label = e && !strcmp(e, "label"); }
+    if (!by_label && !dm_pad_labelled(g.controller)) { GCControllerButtonInput *t = a; a = b; b = t; t = x; x = y; y = t; }   // by position: right A, bottom B, top X, left Y
     return (a.isPressed ? DM_BTN_A : 0) | (b.isPressed ? DM_BTN_B : 0) | (x.isPressed ? DM_BTN_X : 0) | (y.isPressed ? DM_BTN_Y : 0);
 }
