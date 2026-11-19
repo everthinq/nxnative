@@ -15,7 +15,8 @@ its iOS 18 notes.
 | --- | --- |
 | Mac host and app build on macOS 15 with Xcode 26.2 | works (host and launcher `minos 15.0`) |
 | Window, present path and display link under `DM_METAL3=1` | works: Balatro (OpenGL, `0100CD801CE5E000`) plays windowed on an M1 / macOS 15.8, no `[RED]` lines, about 45 ms game-to-screen |
-| NVN games (the Metal 3 replay itself) | **not tested on a Mac yet**; on iOS 18 the same backend ran Kirby's Return to Dream Land Deluxe |
+| NVN games (the Metal 3 replay itself) | works: Cat Quest II (Unity, `01008BE00E968000`, update v720896, provisional profile) plays windowed on an M1 / macOS 15.8 at a steady 60 fps, no dropped frames, GPU about 2.5 ms per frame, about 1.2 GB |
+| Cat Quest (`0100A2F006FBE000`, older Unity) | does not build: the NSO rewriter stops on a jump table (`patch_nso.py`, `jump table 99e180`), before any graphics code runs |
 | Vulkan games under `DM_METAL3=1` | not tested |
 
 ## Requirements
@@ -75,6 +76,8 @@ On top of `dreampiggy/nxnative-iOS18@e8d54cd2` (upstream `e0cf2ac7` plus the Met
 - Placement-sparse textures use the whole-texture fallback (as on iOS 18); GPU-written sparse aliases are unverified.
 - No Metal 4 pipeline archives: pipelines are built through the device at run time, so first encounters can hitch.
 - No GPU timestamps / `DM_NVN_GPUPROF`.
+- The build's pipeline-archive step (`pso_offline`, a Metal 4 feature) fails under Xcode 26 with `air-tt command failed`; the
+  app is packed without an archive, which the Metal 3 backend does not use anyway.
 - MetalFX uses the classic spatial and temporal scalers.
 - Upstream `main` cannot be merged in: it requires Xcode 27.2 and moves quickly. This branch stays on its base and
   takes fixes selectively.
