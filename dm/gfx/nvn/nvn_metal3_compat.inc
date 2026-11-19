@@ -244,20 +244,40 @@ static void nx3_pipeline_stage(NX3PipelineBindings *mask, NSArray<id<MTLBinding>
 // hazard tracking no longer orders an encoder that writes through a pointee before one that reads it.
 // The replay's MTL4 queue barriers say where that order is needed: each encoder waits (at its start) on
 // the fence the last encoder updated, before the stages the barriers name, and updates the other fence at
-// its end. Two fences so no encoder waits on the fence it updates. Encoding is on the replay thread.
-static id<MTLFence> nx3_fences[2];
-static int nx3_fence_last;           // the fence the last ended encoder updated
-static MTLStages nx3_fence_before;   // the later stages the last end barrier ordered (beforeQueueStages)
-static uint64_t nx3_fence_waits, nx3_fence_updates;
+// its end. Two fences so no encoder waits on the fence it updates. One chain per command buffer (the
+// upload buffer is filled while the frame's is still open and committed on its own); a buffer's first
+// encoder waits on the boundary fence, which each buffer updates at its commit after its chain's last
+// update (waits resolve in commit order, so this also orders a buffer after one committed before it
+// though encoded later: the upload buffer).
+@interface NX3FenceChain : NSObject { @public id<MTLFence> f[2]; int last; MTLStages before; uint64_t updates; } @end
+@implementation NX3FenceChain @end
+static char nx3_chain_key;
+static id<MTLFence> nx3_boundary_fence; static _Atomic int nx3_boundary_used;
+static id<MTLFence> nx3_boundary(id<MTLDevice> d) {
+    static dispatch_once_t once; dispatch_once(&once, ^{ nx3_boundary_fence = [d newFence]; nx3_boundary_fence.label = @"nx3 command buffer boundary"; });
+    return nx3_boundary_fence;
+}
+static uint64_t nx3_fence_waits, nx3_fence_updates, nx3_fence_links;
+static NX3FenceChain *nx3_chain(id<MTLCommandBuffer> cb) {
+    NX3FenceChain *c = objc_getAssociatedObject(cb, &nx3_chain_key);
+    if (!c) {
+        c = [NX3FenceChain new]; c->f[0] = [cb.device newFence]; c->f[1] = [cb.device newFence];
+        objc_setAssociatedObject(cb, &nx3_chain_key, c, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return c;
+}
+static void nx3_chain_commit(id<MTLCommandBuffer> cb) {
+    NX3FenceChain *c = objc_getAssociatedObject(cb, &nx3_chain_key);
+    if (!c || !c->updates) return;
+    id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder]; e.label = @"nx3 commit boundary";
+    [e waitForFence:c->f[c->last]]; [e updateFence:nx3_boundary(cb.device)]; [e endEncoding];
+    atomic_store(&nx3_boundary_used, 1);
+}
 static int nx3_fence_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("DM_M3_FENCE"); on = nx3_declare_mode() == 3 && !(e && !strcmp(e, "0"));
         fprintf(stderr, "[dm] [metal3] queue barriers as a fence chain: %s (DM_M3_FENCE)\n", on ? "on" : "off"); }
     return on;
-}
-static id<MTLFence> nx3_fence(id<MTLDevice> d, int i) {
-    if (!nx3_fences[0]) { nx3_fences[0] = [d newFence]; nx3_fences[1] = [d newFence]; nx3_fences[0].label = @"nx3 queue barrier 0"; nx3_fences[1].label = @"nx3 queue barrier 1"; }
-    return nx3_fences[i];
 }
 static MTLRenderStages nx3_render_stages(MTLStages s) {
     MTLRenderStages r = 0;
@@ -300,9 +320,12 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
 - (void)fenceBegin {
     fenceUpdated = NO;
     if (!nx3_fence_on()) return;
-    MTLStages b = nx3_fence_before | fenceWait; fenceWait = 0;
-    if (!b || !nx3_fence_updates) return;
-    id<MTLFence> f = nx3_fence(cb.device, nx3_fence_last);
+    NX3FenceChain *c = nx3_chain(cb);
+    MTLStages b = c->before | fenceWait; fenceWait = 0;
+    id<MTLFence> f = nil;
+    if (!c->updates) { f = atomic_load(&nx3_boundary_used) ? nx3_boundary(cb.device) : nil; b = MTLStageAll; if (f) nx3_fence_links++; }   // the buffer's first encoder: after the buffers committed before it
+    else f = c->f[c->last];
+    if (!b || !f) return;
     if (kind == 1) { MTLRenderStages r = nx3_render_stages(b); if (r) [(id<MTLRenderCommandEncoder>)native waitForFence:f beforeStages:r]; }
     else if (kind == 2) [(id<MTLComputeCommandEncoder>)native waitForFence:f];
     else [(id<MTLBlitCommandEncoder>)native waitForFence:f];
@@ -310,13 +333,14 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
 }
 - (void)fenceEnd:(MTLStages)after {
     if (!nx3_fence_on() || !native || fenceUpdated) return;
-    id<MTLFence> f = nx3_fence(cb.device, nx3_fence_last ^ 1);
+    NX3FenceChain *c = nx3_chain(cb);
+    id<MTLFence> f = c->f[c->last ^ 1];
     if (kind == 1) { MTLRenderStages r = nx3_render_stages(after); [(id<MTLRenderCommandEncoder>)native updateFence:f afterStages:r ? r : MTLRenderStageVertex | MTLRenderStageFragment]; }
     else if (kind == 2) [(id<MTLComputeCommandEncoder>)native updateFence:f];
     else [(id<MTLBlitCommandEncoder>)native updateFence:f];
-    nx3_fence_last ^= 1; fenceUpdated = YES; nx3_fence_updates++;
+    c->last ^= 1; c->updates++; fenceUpdated = YES; nx3_fence_updates++;
     static double last; double now = CACurrentMediaTime();
-    if (now - last >= 10.0) { if (last) fprintf(stderr, "[dm] [metal3] fence chain: %llu updates, %llu waits so far\n", (unsigned long long)nx3_fence_updates, (unsigned long long)nx3_fence_waits); last = now; }
+    if (now - last >= 10.0) { if (last) fprintf(stderr, "[dm] [metal3] fence chains: %llu updates, %llu waits, %llu waits on the commit boundary so far\n", (unsigned long long)nx3_fence_updates, (unsigned long long)nx3_fence_waits, (unsigned long long)nx3_fence_links); last = now; }
 }
 - (BOOL)conformsToProtocol:(Protocol *)p { return p == @protocol(NX3Encoder) || p == @protocol(NX3RenderEncoder) || p == @protocol(NX3ComputeEncoder) || [super conformsToProtocol:p]; }
 - (void)applyTable:(NX3Table *)table stage:(int)stage {
@@ -420,7 +444,7 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
     if (s & MTLRenderStageObject) ot=table; if (s & MTLRenderStageMesh) mt=table;
 }
 - (void)setArgumentTable:(NX3Table *)table { if (ct != table) [self resetBindings]; ct = table; }
-- (void)endEncoding { if (native && !fenceUpdated && nx3_fence_on()) { [self fenceEnd:MTLStageAll]; nx3_fence_before = MTLStageAll; } [native endEncoding]; native = nil; }
+- (void)endEncoding { if (native && !fenceUpdated && nx3_fence_on()) { [self fenceEnd:MTLStageAll]; nx3_chain(cb)->before = MTLStageAll; } [native endEncoding]; native = nil; }
 // Queue-boundary visibility is supplied by classic tracked resource hazards.
 // These calls occur at encoder boundaries; an intra-render memory barrier is
 // neither equivalent nor legal with an after-fragment stage on Apple GPUs.
@@ -429,8 +453,9 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
     (void)a; (void)v;
     if (!nx3_fence_on() || !b) return;
     if (!native) { fenceWait |= b; return; }
-    if (!nx3_fence_updates) return;
-    id<MTLFence> f = nx3_fence(cb.device, nx3_fence_last);
+    NX3FenceChain *c = nx3_chain(cb);
+    if (!c->updates) return;
+    id<MTLFence> f = c->f[c->last];
     if (kind == 1) { MTLRenderStages r = nx3_render_stages(b); if (r) [(id<MTLRenderCommandEncoder>)native waitForFence:f beforeStages:r]; }
     else if (kind == 2) [(id<MTLComputeCommandEncoder>)native waitForFence:f];
     else [(id<MTLBlitCommandEncoder>)native waitForFence:f];
@@ -439,7 +464,7 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
 - (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(NSUInteger)v {
     (void)v;
     if (!nx3_fence_on() || !native) return;
-    [self fenceEnd:a]; nx3_fence_before = b;
+    [self fenceEnd:a]; nx3_chain(cb)->before = b;
 }
 - (void)barrierAfterEncoderStages:(MTLStages)a beforeEncoderStages:(MTLStages)b visibilityOptions:(NSUInteger)v {
     (void)v;
@@ -543,6 +568,7 @@ static void nx3_present_read_resources(NX3Encoder *encoder, id<MTLTexture> sourc
     for (NSUInteger i = 0; i < n; i++) { NX3CommandBuffer *b = (NX3CommandBuffer *)buffers[i]; id<MTLCommandBuffer> cb = b.native; NSArray *handlers = [o.handlers copy]; dispatch_queue_t q = self.feedbackQueue;
         if (handlers.count) [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { NX3Feedback *f = [NX3Feedback new]; f.buffer = done; dispatch_block_t invoke = ^{ for (void (^block)(id<NX3Feedback>) in handlers) block(f); }; if (q) dispatch_async(q, invoke); else invoke(); }];
         nx3_rs_sync(self.native);
+        if (nx3_fence_on()) nx3_chain_commit(cb);
         [cb commit]; self.last = cb;
     }
 }
