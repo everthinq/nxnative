@@ -1,7 +1,7 @@
 # nxnative
 
 > [!NOTE]
-> **This fork, branch `metal3-mac`: runs on macOS 15 Sequoia** (tested: Balatro, Cat Quest, Cat Quest II). It builds the Mac app on the opt-in Metal 3 backend
+> **This fork, branch `metal3-mac`: runs on macOS 15 Sequoia** (tested: Balatro, Cat Quest, Cat Quest II, Hollow Knight: Silksong). It builds the Mac app on the opt-in Metal 3 backend
 > (`DM_METAL3=1`) for Apple silicon Macs without Metal 4. Unofficial and experimental: see
 > [docs/macos15.md](docs/macos15.md) for the build command, what is tested and the known limits.
 

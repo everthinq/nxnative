@@ -17,7 +17,7 @@ its iOS 18 notes.
 | Window, present path and display link under `DM_METAL3=1` | works: Balatro (OpenGL, `0100CD801CE5E000`) plays windowed on an M1 / macOS 15.8, no `[RED]` lines, about 45 ms game-to-screen |
 | NVN games (the Metal 3 replay itself) | works: Cat Quest II (Unity, `01008BE00E968000`, update v720896, provisional profile) plays windowed on an M1 / macOS 15.8 at a steady 60 fps, no dropped frames, GPU about 2.5 ms per frame, about 1.2 GB |
 | Cat Quest (`0100A2F006FBE000`, Unity 5.6, update v131072, provisional profile) | works: plays windowed and fullscreen on an M1 / macOS 15.8 at 60 fps (p99 16.7 ms, a few dropped frames while loading), GPU about 3.5 ms per frame, about 1.1 GB. Needed the two build fixes below |
-| Hollow Knight: Silksong (`010013C00E930000`, Unity, update v655360 / 1.0.30000) | builds: no rewrite or shader-split fixes needed (3 modules rewritten, 2,450 shaders, Mac app 6.6 GB); the pipeline archive fails with `air-tt` as on Cat Quest, which the Metal 3 backend does not use. Not yet played; it will need more memory than Cat Quest, so close large apps first on an 8 GB Mac |
+| Hollow Knight: Silksong (`010013C00E930000`, Unity, update v655360 / 1.0.30000) | works: steady 60 fps over a ~7-minute session (frame time p50 16.67 ms, GPU about 6 ms a frame, 64 frames dropped in all), memory footprint 1.5–2.4 GB, exited cleanly. No rewrite or shader-split fixes needed (3 modules rewritten, 2,450 shaders, Mac app 6.6 GB); the pipeline archive fails with `air-tt` as on Cat Quest, which the Metal 3 backend does not use. Close large apps first on an 8 GB Mac |
 | Vulkan games under `DM_METAL3=1` | not tested |
 
 ## Requirements
