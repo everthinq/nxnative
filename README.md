@@ -1,5 +1,10 @@
 # nxnative
 
+> [!NOTE]
+> **This fork, branch `metal3-mac`: runs on macOS 15 Sequoia.** It builds the Mac app on the opt-in Metal 3 backend
+> (`DM_METAL3=1`) for Apple silicon Macs without Metal 4. Unofficial and experimental: see
+> [docs/macos15.md](docs/macos15.md) for the build command, what is tested and the known limits.
+
 Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad. One script packs your game into a Mac app or an unsigned IPA that you sideload.
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
@@ -40,7 +45,7 @@ Community projects build on nxnative with tools to turn your games into apps for
 
 ## Requirements
 
-An opt-in [experimental iOS 18 / Metal 3 build](docs/ios18.md) is available for BC-capable devices. The default requirements below are unchanged.
+An opt-in [experimental iOS 18 / Metal 3 build](docs/ios18.md) is available for BC-capable devices, and the same backend builds the [Mac app for macOS 15](docs/macos15.md). The default requirements below are unchanged.
 
 - **Mac:** Apple silicon, macOS 26.6 or later. Building games requires Xcode 27.2.
 - **iPhone:** A17 Pro chip or later, with iOS 26 or later.
