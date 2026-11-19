@@ -43,6 +43,9 @@ DM_METAL3=1 python3 scripts/build_ipa_from_nsp.py ~/Games/<game folder> -k ~/Gam
   (`dm/gfx/tools/dmsh_chain.lock`), and macOS 15 cannot run Xcode 27. Shaders built by another compiler can render
   wrong pictures; report such a case with the game's log.
 - Add `-o <path>.app` to put the app somewhere other than the game folder.
+- The build folder `<title ID>_build` beside the game files holds the converted NSPs, the extracted game and the
+  shader cache (about 10 GB for Silksong). The finished app does not use it, so it can be deleted once the game
+  plays; the next build of that game then starts from scratch and takes the full time again.
 
 The app opens a settings window first; press **Play**. Its log is `~/Library/Logs/nxnative/<title ID>.log` (the
 line `EXPERIMENTAL classic Metal replay` confirms the Metal 3 backend), its saves and `env.txt` are in
