@@ -16,7 +16,7 @@ its iOS 18 notes.
 | Mac host and app build on macOS 15 with Xcode 26.2 | works (host and launcher `minos 15.0`) |
 | Window, present path and display link under `DM_METAL3=1` | works: Balatro (OpenGL, `0100CD801CE5E000`) plays windowed on an M1 / macOS 15.8, no `[RED]` lines, about 45 ms game-to-screen |
 | NVN games (the Metal 3 replay itself) | works: Cat Quest II (Unity, `01008BE00E968000`, update v720896, provisional profile) plays windowed on an M1 / macOS 15.8 at a steady 60 fps, no dropped frames, GPU about 2.5 ms per frame, about 1.2 GB |
-| Cat Quest (`0100A2F006FBE000`, older Unity) | does not build: the NSO rewriter stops on a jump table (`patch_nso.py`, `jump table 99e180`), before any graphics code runs |
+| Cat Quest (`0100A2F006FBE000`, Unity 5.6, update v131072, provisional profile) | works: plays windowed and fullscreen on an M1 / macOS 15.8 at 60 fps (p99 16.7 ms, a few dropped frames while loading), GPU about 3.5 ms per frame, about 1.1 GB. Needed the two build fixes below |
 | Vulkan games under `DM_METAL3=1` | not tested |
 
 ## Requirements
@@ -56,6 +56,14 @@ On top of `dreampiggy/nxnative-iOS18@e8d54cd2` (upstream `e0cf2ac7` plus the Met
    its own Metal libraries and every game, OpenGL and Vulkan shader library read this line
    (`dmsh_chain.mac_min`), so they all target macOS 15 (Metal Shading Language 3.2).
 2. `dm/gfx/nvn/dmsh_chain.h`: the shader-chain version the build regenerates from that change.
+3. `dm/tools/patch_nso.py`: `jump_masked_bit`, a jump table whose index is a low-bit mask with its top bit branched away by a
+   `tbnz` (`and w16,w15,#7; tbnz w15,#2,out; ldrsw; add x18; br x18`: 4 entries). Cat Quest `main+0x99e180` stopped the rewrite
+   with `jump table 99e180`. Tried only after every other form fails, so other games rewrite as before. Upstream has since replaced
+   these recognizers with a general solver (`jump_solver.py`), too large to take onto this base.
+4. `dm/gfx/tools/unityfs.py`: Unity 5.6.0b11's Shader type hash (`a70f7abc…`) reads with the 5.5 layout. AssetRipper's
+   5.5.0f3 and 5.6.0b11 trees differ only by a plain string for `FastPropertyName { string }` and `int` for `unsigned int`
+   `m_SourceMap`, the same bytes; Cat Quest's 5 built-in Shader objects read to their exact ends (35 programs). Before, the shader
+   split stopped on `unity default resources` (no type trees).
 
 ## Checked on macOS 15
 
@@ -79,6 +87,11 @@ On top of `dreampiggy/nxnative-iOS18@e8d54cd2` (upstream `e0cf2ac7` plus the Met
 - The build's pipeline-archive step (`pso_offline`, a Metal 4 feature) fails under Xcode 26 with `air-tt command failed`; the
   app is packed without an archive, which the Metal 3 backend does not use anyway.
 - MetalFX uses the classic spatial and temporal scalers.
+- Once, on an 8 GB M1, the whole Mac stopped responding (only the cursor moved) within half a minute after Cat Quest quit
+  cleanly (exit 0), and needed a forced restart. The cause is unknown: the system log lost its last lines in the restart and
+  no panic or hang report was written; memory pressure was high during the run. If it happens, press
+  Shift+Control+Option+Command+. (period) and wait 2–3 minutes before restarting: the sysdiagnose in `/private/var/tmp/`
+  names what was stuck.
 - Upstream `main` cannot be merged in: it requires Xcode 27.2 and moves quickly. This branch stays on its base and
   takes fixes selectively.
 

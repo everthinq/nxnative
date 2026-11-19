@@ -1249,6 +1249,49 @@ def table_cands(insl, rb):
         m = re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', q.op_str) if q is not None and q.mnemonic == 'add' else None
         if m: cands.add(p.operands[1].imm + int(m.group(1), 0))
     return sorted(cands)
+def jump_masked_bit(insl, j):
+    """A low-bit mask whose top bit is tested away: and wI,wS,#M; tbnz wS,#b,out; ldrsw xE,[xB,xI,lsl #2]; add x18,xE,xB; br x18, with M = 2^(b+1) - 1.
+    Cat Quest 1.2.0 main+0x99e180 (Unity) masks with 7 and leaves on bit 2, so the index is 0..3: exactly 2^b entries. The tbnz must directly follow the and and test its source
+    (or the masked index itself); from the and to the br the code is straight-line and contiguous, the index, entry, base and x18 are written only where the form says, no branch
+    or resolved jump table lands after the and, the base comes from adrp + add (copied_base) and every target is an instruction of the function outside the run.
+    Tried only after every other form has failed, so sites that rewrote before come out the same. Returns all targets, or None if not recognized"""
+    ctx = insl[max(0, j - 16):j + 1]
+    add = next((p for p in reversed(ctx[:-1]) if p.mnemonic == 'add' and re.fullmatch(r'x18, x\d+, x\d+', p.op_str)), None)
+    if not add: return None
+    _, ent, base = add.op_str.split(', '); ka = ctx.index(add)
+    ld = next((p for p in reversed(ctx[:ka]) if p.mnemonic == 'ldrsw' and re.fullmatch(rf'{ent}, \[{base}, x\d+, lsl #2\]', p.op_str)), None)
+    if not ld: return None
+    kl = ctx.index(ld); idx = ld.op_str.split(', ')[2]
+    if base in (ent, idx) or 'x18' in (base, idx): return None
+    km = next((k for k in range(kl - 1, -1, -1) if writes_reg(ctx[k], idx)), None)   # the last writer of the index before the load
+    if km is None or km + 1 >= kl: return None
+    mask, test = ctx[km], ctx[km + 1]
+    mm = re.fullmatch(r'([wx]\d+), ([wx]\d+), #(0x[0-9a-f]+|\d+)', mask.op_str) if mask.mnemonic == 'and' else None
+    mt = re.fullmatch(r'([wx]\d+), #(0x[0-9a-f]+|\d+), #(0x[0-9a-f]+|\d+)', test.op_str) if test.mnemonic == 'tbnz' else None
+    if not (mm and mt) or num(mm.group(1)) != num(idx): return None
+    src, m_, bit = num(mm.group(2)), int(mm.group(3), 0), int(mt.group(2), 0)
+    if not m_ or m_ & (m_ + 1) or m_ != (2 << bit) - 1 or bit > 8 or num(mt.group(1)) not in (src, num(idx)): return None
+    n = 1 << bit
+    run = ctx[km:]
+    if any(b.address != a.address + 4 for a, b in zip(run, run[1:])): return None
+    head, end = mask.address, insl[j].address
+    if head <= test.operands[-1].imm <= end: return None   # the bit-set path must leave the dispatch
+    def writes(p, reg):
+        if p.mnemonic in ('bl', 'blr') and int(reg[1:]) <= 18: return True
+        return writes_reg(p, reg)
+    if any(writes(p, idx) for p in ctx[km + 2:kl]) or any(writes(p, ent) for p in ctx[kl + 1:ka]) or \
+       any(writes(p, base) for p in ctx[kl + 1:ka]) or any(writes(p, 'x18') for p in ctx[ka + 1:-1]): return None
+    if any(p.mnemonic in ('b', 'bl', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz') or p.mnemonic.startswith('b.') for p in ctx[km + 2:-1]): return None
+    for p in insl:
+        if p.mnemonic in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or p.mnemonic.startswith('b.'):
+            if head < p.operands[-1].imm <= end: return None
+    if any(head < t <= end for targets in tabjumps.values() for t in targets): return None
+    if any(b <= end and b + 4 * width > head + 4 for b, width in jumps.values()): return None
+    tb = copied_base(insl, insl.index(ld), base)
+    if tb is None or tb < 0 or tb + 4 * n > len(IMG): return None
+    targets = [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+    addresses = {p.address for p in insl}
+    return targets if all(t in addresses and not head < t <= end for t in targets) else None
 def jump_masked_pred(insl, j):
     """The offset-table form whose bounds check is on a masked copy of the index made in the block itself, while the index register was masked in the one block that branches here
     (FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition 1.0.0 main+0x2d103cc: and x6,x17,#0x7ff; ubfx w18,w17,#0xb,#2; cbz w18,#0x2d103b8 at main+0x2d1024c, then at main+0x2d103b8
@@ -1540,6 +1583,7 @@ for fa, fb in funcs:
                 if not tgt: tgt = jump_masked_not(insl, j)   # a complemented low-bit index with its zero case branched away: exactly mask entries
                 if not tgt: tgt = jump_offsets(insl, j, copy_first=True, far_base=True, forward_base=True)   # a unique base initialized in a later block that branches backward
                 if not tgt: tgt = jump_zero_extended(insl, j)   # a 32-bit checked value zero-extended into the index, with its full path to the br verified
+                if not tgt: tgt = jump_masked_bit(insl, j)   # a low-bit mask whose top bit a tbnz branches away (Cat Quest main+0x99e180)
                 assert tgt, f'jump table {ins.address:x}'
                 tabjumps[ins.address] = tgt; continue
             jumps[ins.address] = (base, width)

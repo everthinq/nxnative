@@ -311,7 +311,10 @@ SHADER_2021_3 = SHADER_2021_2.replace('SerializedProgram: vector<data:Serialized
     ).replace('vector<data:UInt8> compressedBlob;', 'vector<data:UInt8> compressedBlob; vector<data:unsigned int> stageCounts;')
 
 CLASS_COMPUTE_SHADER = 72
+# Unity 5.6.0b11 (Cat Quest 1.2.0's unity default resources, no bundles) has another Shader hash but the same bytes: its tree (AssetRipper TypeTreeDumps) differs from 5.5.0f3's
+# only by a plain string where 5.5 has FastPropertyName { string name }, and int m_SourceMap for unsigned int, so it reads with SHADER_5_5
 KNOWN_TREES = {(CLASS_SHADER, bytes.fromhex('4496e93f2179252104401c8dda0a1751')): ('Shader', SHADER_5_5),
+               (CLASS_SHADER, bytes.fromhex('a70f7abc6586fb35b3a0641aa81e9375')): ('Shader', SHADER_5_5),
                (CLASS_SHADER, bytes.fromhex('f0c184272a05e54447e36366ec4876a6')): ('Shader', SHADER_2021_3),
                (CLASS_SHADER, bytes.fromhex('ea424a5fc1e48db62144df956f9e1005')): ('Shader', SHADER_2022_3),
                (CLASS_SHADER, bytes.fromhex('d8236c9bd87d85edb203acf352348124')): ('Shader', SHADER_2021_2),
