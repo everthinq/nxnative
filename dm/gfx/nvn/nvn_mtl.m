@@ -247,9 +247,12 @@ static void gpu_lost_release(void) {
 }
 // Metal 4 reports a commit's error as MTL4CommandQueueErrorTimeout with no text, and the command buffer's own error underneath (NSUnderlyingErrorKey, NSMultipleUnderlyingErrorsKey):
 // every command buffer error in both #1326 logs has that shape. Only this domain counts: an innocent victim's IOGPU error underneath has code 5 too
+// MTL4CommandQueueErrorDomain is a macOS 26 symbol: on macOS 15 (DM_METAL3) its weak import is NULL and reading it crashed the host at the first GPU error.
+// There Metal 3 reports the revoke as MTLCommandBufferErrorDomain / MTLCommandBufferErrorAccessRevoked (the "SubmissionsIgnored" IOGPU error underneath)
 static int gpu_err_has(NSError *e, NSInteger code, int depth) {
     if (!e || depth > 3) return 0;
-    if (e.code == code && [e.domain isEqualToString:MTL4CommandQueueErrorDomain]) return 1;
+    if (@available(macOS 26.0, *)) { if (e.code == code && [e.domain isEqualToString:MTL4CommandQueueErrorDomain]) return 1; }
+    if (code == MTL4CommandQueueErrorAccessRevoked && e.code == MTLCommandBufferErrorAccessRevoked && [e.domain isEqualToString:MTLCommandBufferErrorDomain]) return 1;
     for (NSError *u in e.underlyingErrors) if (gpu_err_has(u, code, depth + 1)) return 1;
     return 0;
 }

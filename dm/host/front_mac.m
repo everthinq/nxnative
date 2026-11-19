@@ -660,6 +660,25 @@ static void *guest_tramp(void *p) {
     ((guest_arg *)p)->fn(); LOG("guest thread finished"); exit(0);
 }
 
+// Frame-rate counter (DM_SHOW_FPS=1, env.txt or the run command): the frames put on screen in the last second, small, in the window's top-right corner. The iPhone's counter
+// (front_ios.m) ported: nvn_mtl.m counts the presents for NVN and the Vulkan layer alike. The game view is not flipped, so the top margin stays fixed as the window resizes
+uint64_t mtl_present_count(void);
+static void front_mac_fps_label(NSView *v) {
+    NSTextField *l = [NSTextField labelWithString:@"-- fps"];
+    l.font = [NSFont monospacedDigitSystemFontOfSize:10 weight:NSFontWeightSemibold]; l.textColor = [NSColor colorWithWhite:1 alpha:0.85]; l.alignment = NSTextAlignmentCenter;
+    l.drawsBackground = YES; l.backgroundColor = [NSColor colorWithWhite:0 alpha:0.35]; l.wantsLayer = YES; l.layer.cornerRadius = 4; l.layer.masksToBounds = YES;
+    NSRect b = v.bounds; const CGFloat w = 46, h = 15, m = 6;
+    l.frame = NSMakeRect(NSMaxX(b) - w - m, NSMaxY(b) - h - m, w, h); l.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [v addSubview:l];
+    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
+        if (now - t0 < 1.5) l.stringValue = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];   // a longer span is a stall or a sleep: no reading
+        n0 = n; t0 = now;
+    }];
+    LOG("front end: frame-rate counter on (DM_SHOW_FPS)");
+}
+
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
 __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
 
@@ -1533,6 +1552,7 @@ void front_run(void (*guest)(void)) {
         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen
         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) LOG("front end: Metal performance HUD on (DM_METAL_HUD)");
         v.layer = g_layer; [(DmGameView *)v fitDrawable];
+        if (getenv("DM_SHOW_FPS") && atoi(getenv("DM_SHOW_FPS"))) front_mac_fps_label(v);
         [win center];
         [win makeKeyAndOrderFront:nil];
         screen_refresh(win.screen ?: NSScreen.mainScreen);

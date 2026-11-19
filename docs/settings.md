@@ -91,7 +91,7 @@ Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizo
 
 ### Frame-rate counter
 
-Shows the frames per second at the top left.
+Shows the frames per second: at the top left on the iPhone, small in the window's top-right corner on the Mac.
 
 ## Controls
 
