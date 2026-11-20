@@ -1,7 +1,9 @@
 # nxnative
 
 > [!NOTE]
-> **This fork, branch `metal3-mac`: runs on macOS 15 Sequoia** (tested: Balatro, Cat Quest, Cat Quest II, Cat Quest III, Hollow Knight: Silksong, Rune Dice, Hades, Hades II; The Legend of Zelda: Tears of the Kingdom runs but is shelved: 30 fps outside and recurring GPU page faults on an M1 Air). It builds the Mac app on the opt-in Metal 3 backend
+> **Archived 2026-11-20: simple games play well on an M1 Air (8 GB) under macOS 15, Zelda: Tears of the Kingdom does not, so this Mac moved to macOS 27 and upstream `main`; see [docs/macos15.md](docs/macos15.md).**
+>
+> **This fork, branch `metal3-mac`: runs on macOS 15 Sequoia** (tested: Balatro, Cat Quest, Cat Quest II, Cat Quest III, Hollow Knight: Silksong, Rune Dice, Hades, Hades II, Untitled Goose Game; The Legend of Zelda: Tears of the Kingdom runs but is shelved: 30 fps outside and recurring GPU page faults on an M1 Air). It builds the Mac app on the opt-in Metal 3 backend
 > (`DM_METAL3=1`) for Apple silicon Macs without Metal 4. Unofficial and experimental: see
 > [docs/macos15.md](docs/macos15.md) for the build command, what is tested and the known limits.
 
